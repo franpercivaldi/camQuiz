@@ -8,7 +8,6 @@ export default function CameraPage() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastShotUrl, setLastShotUrl] = useState<string | null>(null);
-  const [mode, setMode] = useState<"MC" | "VF">("MC");
   const [isSending, setIsSending] = useState(false);
   const [serverResp, setServerResp] = useState<AnswerPayload | null>(null);
 
@@ -17,16 +16,11 @@ export default function CameraPage() {
     (async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          // con muted + playsInline + autoPlay debería reproducir solo en móvil
           await videoRef.current.play().catch(() => {});
           setReady(true);
         }
@@ -35,9 +29,7 @@ export default function CameraPage() {
         setError(e?.message || "No se pudo acceder a la cámara");
       }
     })();
-    return () => {
-      stream?.getTracks().forEach((t) => t.stop());
-    };
+    return () => { stream?.getTracks().forEach((t) => t.stop()); };
   }, []);
 
   const shoot = async () => {
@@ -50,17 +42,11 @@ export default function CameraPage() {
     canvas.height = h;
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, w, h);
-
-    // calidad 0.9 para achicar peso sin perder legibilidad
     const url = canvas.toDataURL("image/jpeg", 0.9);
     setLastShotUrl(url);
-    setServerResp(null); // limpiar resultado previo
-
-    // descarga local para inspección (opcional)
+    setServerResp(null);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `shot_${Date.now()}.jpg`;
-    a.click();
+    a.href = url; a.download = `shot_${Date.now()}.jpg`; a.click();
   };
 
   return (
@@ -74,8 +60,8 @@ export default function CameraPage() {
           muted
           playsInline
           autoPlay
-          style={{ width: "100%", borderRadius: 12, transform: "rotate(0deg)" }}
-          onClick={shoot} // permite disparar con control BT (simula click)
+          style={{ width: "100%", borderRadius: 12 }}
+          onClick={shoot}
         />
         <canvas ref={canvasRef} style={{ display: "none" }} />
       </div>
@@ -84,16 +70,6 @@ export default function CameraPage() {
         <button onClick={shoot} disabled={!ready} style={{ padding: 12, borderRadius: 12 }}>
           Disparar (o usa el control)
         </button>
-
-        <select
-          value={mode}
-          onChange={(e) => setMode(e.target.value as "MC" | "VF")}
-          style={{ padding: 12, borderRadius: 12 }}
-          aria-label="Modo de respuesta"
-        >
-          <option value="MC">MC (A–E)</option>
-          <option value="VF">V/F</option>
-        </select>
       </div>
 
       <button
@@ -101,7 +77,7 @@ export default function CameraPage() {
           if (!lastShotUrl || isSending) return;
           try {
             setIsSending(true);
-            const resp = await postAnswer(lastShotUrl, mode);
+            const resp = await postAnswer(lastShotUrl);
             setServerResp(resp);
           } catch (e: any) {
             alert(`Error: ${e?.message || e}`);
