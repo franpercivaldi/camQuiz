@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
     const model = process.env.OPENAI_MODEL || "gpt-5";
     const completion = await client.chat.completions.create({
       model,
-      temperature: 0,
+      temperature: 1,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: SYSTEM },
