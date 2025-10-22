@@ -33,7 +33,7 @@ export default function CameraPage() {
   }, []);
 
   const shoot = async () => {
-    if (!ready) return;
+    if (!ready || isSending) return;
     const video = videoRef.current!;
     const canvas = canvasRef.current!;
     const w = video.videoWidth;
@@ -42,11 +42,25 @@ export default function CameraPage() {
     canvas.height = h;
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(video, 0, 0, w, h);
+
     const url = canvas.toDataURL("image/jpeg", 0.9);
     setLastShotUrl(url);
     setServerResp(null);
+
+    // descarga local para inspección (opcional)
     const a = document.createElement("a");
     a.href = url; a.download = `shot_${Date.now()}.jpg`; a.click();
+
+    // auto-enviar
+    try {
+      setIsSending(true);
+      const resp = await postAnswer(url);
+      setServerResp(resp);
+    } catch (e: any) {
+      alert(`Error: ${e?.message || e}`);
+    } finally {
+      setIsSending(false);
+    }
   };
 
   return (
@@ -61,34 +75,29 @@ export default function CameraPage() {
           playsInline
           autoPlay
           style={{ width: "100%", borderRadius: 12 }}
-          onClick={shoot}
+          onClick={shoot} // permite disparar con control BT (simula click)
         />
         <canvas ref={canvasRef} style={{ display: "none" }} />
+
+        {isSending && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              background: "rgba(0,0,0,0.45)",
+              display: "grid",
+              placeItems: "center",
+              borderRadius: 12,
+              fontWeight: 600,
+            }}
+          >
+            Procesando…
+          </div>
+        )}
       </div>
 
-      <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={shoot} disabled={!ready} style={{ padding: 12, borderRadius: 12 }}>
-          Disparar (o usa el control)
-        </button>
-      </div>
-
-      <button
-        onClick={async () => {
-          if (!lastShotUrl || isSending) return;
-          try {
-            setIsSending(true);
-            const resp = await postAnswer(lastShotUrl);
-            setServerResp(resp);
-          } catch (e: any) {
-            alert(`Error: ${e?.message || e}`);
-          } finally {
-            setIsSending(false);
-          }
-        }}
-        disabled={!lastShotUrl || isSending}
-        style={{ padding: 12, borderRadius: 12, opacity: !lastShotUrl ? 0.6 : 1 }}
-      >
-        {isSending ? "Enviando…" : "Enviar a /api/answer"}
+      <button onClick={shoot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
+        Disparar (o usa el control)
       </button>
 
       {serverResp && (
@@ -105,8 +114,8 @@ export default function CameraPage() {
                 style={{
                   height: 8,
                   width: `${Math.round(serverResp.confidence * 100)}%`,
-                  background: "#4ade80",
                   borderRadius: 8,
+                  background: "#4ade80",
                   transition: "width 200ms ease",
                 }}
               />
