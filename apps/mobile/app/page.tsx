@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
-import { postAnswer, type AnswerPayload } from "../../lib/api";
+import { postAnswer, type AnswerPayload } from "../lib/api";
 
 export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
