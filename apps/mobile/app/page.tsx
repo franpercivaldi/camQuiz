@@ -5,12 +5,44 @@ import { postAnswer, type AnswerPayload } from "../lib/api";
 export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null); // +++
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [serverResp, setServerResp] = useState<AnswerPayload | null>(null);
-  const lastShotTs = useRef<number>(0); // anti-doble-disparo
+  const lastShotTs = useRef<number>(0);
 
+  // Disparo
+  const shoot = useCallback(async () => {
+    if (!ready || isSending) return;
+    const now = Date.now();
+    if (now - lastShotTs.current < 800) return; // anti-doble
+    lastShotTs.current = now;
+
+    const video = videoRef.current!;
+    const canvas = canvasRef.current!;
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(video, 0, 0, w, h);
+
+    const url = canvas.toDataURL("image/jpeg", 0.9);
+    setServerResp(null);
+
+    try {
+      setIsSending(true);
+      const resp = await postAnswer(url);
+      setServerResp(resp);
+    } catch (e: any) {
+      alert(`Error: ${e?.message || e}`);
+    } finally {
+      setIsSending(false);
+    }
+  }, [ready, isSending]);
+
+  // Cámara
   useEffect(() => {
     let stream: MediaStream;
     (async () => {
@@ -32,42 +64,10 @@ export default function CameraPage() {
     return () => { stream?.getTracks().forEach((t) => t.stop()); };
   }, []);
 
-  const shoot = useCallback(async () => {
-    if (!ready || isSending) return;
-
-    // anti “rebote” si el control manda múltiples eventos
-    const now = Date.now();
-    if (now - lastShotTs.current < 800) return;
-    lastShotTs.current = now;
-
-    const video = videoRef.current!;
-    const canvas = canvasRef.current!;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(video, 0, 0, w, h);
-
-    const url = canvas.toDataURL("image/jpeg", 0.9);
-    setServerResp(null);
-
-    // envío automático (SIN descargar ni abrir nada)
-    try {
-      setIsSending(true);
-      const resp = await postAnswer(url);
-      setServerResp(resp);
-    } catch (e: any) {
-      alert(`Error: ${e?.message || e}`);
-    } finally {
-      setIsSending(false);
-    }
-  }, [ready, isSending]);
-
-  // Disparo por control BT (emula teclado): Enter / Space / NumpadEnter / MediaPlayPause
+  // Teclado (Enter/Space/NumpadEnter)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const keys = new Set(["Enter", " ", "NumpadEnter", "MediaPlayPause"]);
+      const keys = new Set(["Enter", " ", "NumpadEnter"]);
       if (keys.has(e.key)) {
         e.preventDefault();
         shoot();
@@ -75,6 +75,46 @@ export default function CameraPage() {
     };
     window.addEventListener("keydown", onKeyDown, { passive: false });
     return () => window.removeEventListener("keydown", onKeyDown);
+  }, [shoot]);
+
+  // Media keys (Play/Pause/Prev/Next) vía Media Session
+  useEffect(() => {
+    // Audio silencioso para activar la sesión (muted para permitir autoplay)
+    const el = document.createElement("audio");
+    el.muted = true;
+    el.loop = true;
+    // 1 segundo de silencio PCM WAV (data URL corta)
+    el.src =
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+    audioRef.current = el;
+    el.play().catch(() => {
+      // algunos navegadores requieren un tap inicial; si no, igual los handlers se setean
+    });
+
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: "Camera Remote" });
+      const set = (action: MediaSessionAction, handler: () => void) => {
+        try { navigator.mediaSession!.setActionHandler(action, handler); } catch {}
+      };
+      set("play", shoot);
+      set("pause", shoot);
+      set("previoustrack", shoot);
+      set("nexttrack", shoot);
+      set("stop", shoot);
+      // opcional: seekto/seekbackward/seekforward podrían mapear a shoot también si querés
+    }
+
+    return () => {
+      try {
+        if ("mediaSession" in navigator) {
+          const clear = (a: MediaSessionAction) => {
+            try { navigator.mediaSession!.setActionHandler(a, null); } catch {}
+          };
+          ["play","pause","previoustrack","nexttrack","stop"].forEach(a => clear(a as MediaSessionAction));
+        }
+      } catch {}
+      try { el.pause(); } catch {}
+    };
   }, [shoot]);
 
   return (
@@ -88,8 +128,7 @@ export default function CameraPage() {
           muted
           playsInline
           autoPlay
-          // Por si igual querés tocar la pantalla, sigue disparando con tap:
-          onClick={shoot}
+          onClick={shoot} // por si querés tocar pantalla
           style={{ width: "100%", borderRadius: 12 }}
         />
         <canvas ref={canvasRef} style={{ display: "none" }} />
@@ -111,34 +150,10 @@ export default function CameraPage() {
         )}
       </div>
 
-      {/* Botón manual por si el control no emite teclas compatibles */}
+      {/* Botón manual como respaldo */}
       <button onClick={shoot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
-        Disparar (control BT o tap)
+        Disparar (control BT / teclas media / tap)
       </button>
-
-      {serverResp && (
-        <div style={{ marginTop: 8, padding: 12, borderRadius: 12, background: "#1b1b1b" }}>
-          <div style={{ fontSize: 14, opacity: 0.7 }}>Respuesta</div>
-          <div style={{ fontSize: 32, fontWeight: 700 }}>
-            {serverResp.answer}
-            <span style={{ fontSize: 16, marginLeft: 8, opacity: 0.7 }}>({serverResp.kind})</span>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            Confianza: {(serverResp.confidence * 100).toFixed(0)}%
-            <div style={{ height: 8, background: "#333", borderRadius: 8, marginTop: 4 }}>
-              <div
-                style={{
-                  height: 8,
-                  width: `${Math.round(serverResp.confidence * 100)}%`,
-                  borderRadius: 8,
-                  background: "#4ade80",
-                  transition: "width 200ms ease",
-                }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </main>
   );
 }
