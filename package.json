@@ -14,5 +14,12 @@
     "engines": {
         "node": ">=20",
         "npm": ">=9"
+    },
+    "devDependencies": {
+        "@capacitor/cli": "^6.2.1",
+        "@capacitor/core": "^7.4.4"
+    },
+    "dependencies": {
+        "@capacitor/ios": "^7.4.4"
     }
 }

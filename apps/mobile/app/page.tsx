@@ -47,6 +47,12 @@ export default function CameraPage() {
     }
   }, [ready, isSending]);
 
+  useEffect(() => {
+    const onVolume = () => shoot();
+    window.addEventListener("volume-trigger" as any, onVolume as any);
+    return () => window.removeEventListener("volume-trigger" as any, onVolume as any);
+  }, [shoot]);
+
   // --- Cámara ---
   useEffect(() => {
     let stream: MediaStream;
