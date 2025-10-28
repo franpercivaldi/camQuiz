@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { postAnswer, type AnswerPayload } from "../lib/api";
 
 export default function CameraPage() {
@@ -7,9 +7,9 @@ export default function CameraPage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastShotUrl, setLastShotUrl] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [serverResp, setServerResp] = useState<AnswerPayload | null>(null);
+  const lastShotTs = useRef<number>(0); // anti-doble-disparo
 
   useEffect(() => {
     let stream: MediaStream;
@@ -32,8 +32,14 @@ export default function CameraPage() {
     return () => { stream?.getTracks().forEach((t) => t.stop()); };
   }, []);
 
-  const shoot = async () => {
+  const shoot = useCallback(async () => {
     if (!ready || isSending) return;
+
+    // anti “rebote” si el control manda múltiples eventos
+    const now = Date.now();
+    if (now - lastShotTs.current < 800) return;
+    lastShotTs.current = now;
+
     const video = videoRef.current!;
     const canvas = canvasRef.current!;
     const w = video.videoWidth;
@@ -44,14 +50,9 @@ export default function CameraPage() {
     ctx.drawImage(video, 0, 0, w, h);
 
     const url = canvas.toDataURL("image/jpeg", 0.9);
-    setLastShotUrl(url);
     setServerResp(null);
 
-    // descarga local para inspección (opcional)
-    const a = document.createElement("a");
-    a.href = url; a.download = `shot_${Date.now()}.jpg`; a.click();
-
-    // auto-enviar
+    // envío automático (SIN descargar ni abrir nada)
     try {
       setIsSending(true);
       const resp = await postAnswer(url);
@@ -61,11 +62,24 @@ export default function CameraPage() {
     } finally {
       setIsSending(false);
     }
-  };
+  }, [ready, isSending]);
+
+  // Disparo por control BT (emula teclado): Enter / Space / NumpadEnter / MediaPlayPause
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const keys = new Set(["Enter", " ", "NumpadEnter", "MediaPlayPause"]);
+      if (keys.has(e.key)) {
+        e.preventDefault();
+        shoot();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, { passive: false });
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [shoot]);
 
   return (
     <main style={{ display: "grid", gap: 12, padding: 12 }}>
-      <h2>QuizCam</h2>
+      <h2>Cámara</h2>
       {error && <p style={{ color: "#f88" }}>{error}</p>}
 
       <div style={{ position: "relative" }}>
@@ -74,8 +88,9 @@ export default function CameraPage() {
           muted
           playsInline
           autoPlay
+          // Por si igual querés tocar la pantalla, sigue disparando con tap:
+          onClick={shoot}
           style={{ width: "100%", borderRadius: 12 }}
-          onClick={shoot} // permite disparar con control BT (simula click)
         />
         <canvas ref={canvasRef} style={{ display: "none" }} />
 
@@ -96,8 +111,9 @@ export default function CameraPage() {
         )}
       </div>
 
+      {/* Botón manual por si el control no emite teclas compatibles */}
       <button onClick={shoot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
-        Disparar (o usa el control)
+        Disparar (control BT o tap)
       </button>
 
       {serverResp && (
