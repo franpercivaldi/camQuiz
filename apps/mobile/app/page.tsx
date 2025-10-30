@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
-import { postAnswer, type AnswerPayload } from "../../lib/api";
+import { postAnswer, type AnswerPayload } from "../lib/api";
 
 type Job = { id: string; ts: number; dataUrl: string };
 type Row = { id: string; ts: number; ok: boolean; resp?: AnswerPayload; err?: string };
