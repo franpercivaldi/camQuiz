@@ -1,240 +1,151 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
-import { postAnswer, type AnswerPayload } from "../lib/api";
+import { postAnswer, type AnswerPayload } from "../../lib/api";
+
+type Job = { id: string; ts: number; dataUrl: string };
+type Row = { id: string; ts: number; ok: boolean; resp?: AnswerPayload; err?: string };
 
 export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const photoCanvasRef = useRef<HTMLCanvasElement | null>(null);     // para tomar la foto full
-  const analyzeCanvasRef = useRef<HTMLCanvasElement | null>(null);   // para análisis (downscaled)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Cámara / estado básico
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isSending, setIsSending] = useState(false);
-  const [serverResp, setServerResp] = useState<AnswerPayload | null>(null);
 
-  // ---- AUTO MODE ----
+  // Programación periódica
   const [autoOn, setAutoOn] = useState(true);
-  const [autoStatus, setAutoStatus] = useState<"inicializando" | "buscando" | "estable" | "capturando" | "enviando">("inicializando");
-  const rafId = useRef<number | null>(null);
-  const stableCount = useRef(0);
-  const lastShotAt = useRef(0);
+  const [intervalSec, setIntervalSec] = useState(40); // cada 40s por defecto
+  const intervalId = useRef<number | null>(null);
 
-  // config de auto
-  const ANALYZE_W = 320;          // downscale para análisis
-  const ROI_RATIO = 0.5;          // 50% central (menos bordes/luz)
-  const PIX_DIFF_THRESH = 20;     // 18–22 suele ir bien con AF de iPhone
-  const MOTION_PCT_THRESH = 3.5;  // antes 0.8 → subimos a 3.5%
-  const STABLE_FRAMES_NEEDED = 6; // menos frames para entrar a “estable”
-  const COOLDOWN_MS = 1500;       // igual
-  const ANALYZE_MIN_MS = 100;     // ~10 fps de análisis (menos nervioso)
-  
-  // beep de feedback
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const beep = useCallback((freq = 1200, dur = 0.12) => {
-    try {
-      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const ac = audioCtxRef.current!;
-      const o = ac.createOscillator();
-      const g = ac.createGain();
-      o.type = "sine";
-      o.frequency.value = freq;
-      g.gain.value = 0.0001;
-      o.connect(g);
-      g.connect(ac.destination);
-      const now = ac.currentTime;
-      o.start(now);
-      g.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-      o.stop(now + dur + 0.01);
-    } catch {}
-  }, []);
+  // Cola de envíos
+  const queueRef = useRef<Job[]>([]);
+  const [queueLen, setQueueLen] = useState(0);
+  const sendingRef = useRef(false);
 
-  // cámara
+  // Resultados
+  const [rows, setRows] = useState<Row[]>([]);
+
+  // --- Cámara ---
   useEffect(() => {
     let stream: MediaStream;
     (async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           await videoRef.current.play().catch(() => {});
           setReady(true);
-          setAutoStatus("buscando");
         }
       } catch (e: any) {
         console.error("getUserMedia error", e);
         setError(e?.message || "No se pudo acceder a la cámara");
       }
     })();
-    return () => {
-      stream?.getTracks().forEach((t) => t.stop());
-    };
+    return () => { stream?.getTracks().forEach((t) => t.stop()); };
   }, []);
 
-  const lastFrameGray = useRef<Uint8ClampedArray | null>(null);
-  const lastMeanY = useRef(0);
-  const lastAnalysisAt = useRef(0);
-  const [dbg, setDbg] = useState({ motionPct: 0, meanY: 0 });
+  // --- Captura a dataURL (con opción de reducir tamaño si quisieras) ---
+  const captureFrame = useCallback((): string | null => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || !video.videoWidth) return null;
 
-
-  // tomar foto completa y enviar
-  const shootAndSend = useCallback(async () => {
-    if (!ready || isSending) return;
-    const now = Date.now();
-    if (now - lastShotAt.current < COOLDOWN_MS) return;
-    lastShotAt.current = now;
-
-    const video = videoRef.current!;
-    const photoCanvas = photoCanvasRef.current!;
-    // foto full a resolución del video
     const w = video.videoWidth;
     const h = video.videoHeight;
-    photoCanvas.width = w;
-    photoCanvas.height = h;
-    const pctx = photoCanvas.getContext("2d")!;
-    pctx.drawImage(video, 0, 0, w, h);
-    const dataUrl = photoCanvas.toDataURL("image/jpeg", 0.9);
 
-    setServerResp(null);
-    setAutoStatus("enviando");
-    beep(1000, 0.08); // beep corto de “capturado”
+    // Si querés reducir tamaño para acelerar uploads, descomenta:
+    // const MAX_W = 1600;
+    // const scale = Math.min(1, MAX_W / w);
+    // const outW = Math.round(w * scale), outH = Math.round(h * scale);
+
+    const outW = w, outH = h; // full-res por ahora
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(video, 0, 0, outW, outH);
+    return canvas.toDataURL("image/jpeg", 0.9);
+  }, []);
+
+  // --- Encolar captura ---
+  const enqueueCapture = useCallback(() => {
+    const dataUrl = captureFrame();
+    if (!dataUrl) return;
+    const job: Job = { id: crypto.randomUUID(), ts: Date.now(), dataUrl };
+    queueRef.current.push(job);
+    setQueueLen(queueRef.current.length);
+    processQueue(); // intentar procesar ya
+  }, [captureFrame]);
+
+  // --- Worker secuencial de la cola ---
+  const processQueue = useCallback(async () => {
+    if (sendingRef.current) return;
+    const job = queueRef.current.shift();
+    if (!job) return;
+
+    sendingRef.current = true;
+    setQueueLen(queueRef.current.length);
 
     try {
-      setIsSending(true);
-      const resp = await postAnswer(dataUrl);
-      setServerResp(resp);
+      const resp = await postAnswer(job.dataUrl);
+      setRows((old) => [ ...old, { id: job.id, ts: job.ts, ok: true, resp }].slice(-100)); // conserva últimos 100
     } catch (e: any) {
-      alert(`Error: ${e?.message || e}`);
+      setRows((old) => [...old, { id: job.id, ts: job.ts, ok: false, err: e?.message || String(e) }].slice(-100));
     } finally {
-      setIsSending(false);
-      // tras enviar, volvemos a buscar otra captura
-      setAutoStatus("buscando");
-      stableCount.current = 0;
+      sendingRef.current = false;
+      // Si quedan trabajos, procesa el siguiente
+      if (queueRef.current.length > 0) processQueue();
     }
-  }, [ready, isSending]);
+  }, []);
 
-  // loop de análisis (autodisparo por estabilidad)
-  const analyzeLoop = useCallback(() => {
-    if (!autoOn || !ready) return;
-
-    // throttle a ~12 fps
-    const now = performance.now();
-    if (now - lastAnalysisAt.current < ANALYZE_MIN_MS) {
-      rafId.current = requestAnimationFrame(analyzeLoop);
-      return;
-    }
-    lastAnalysisAt.current = now;
-
-    const video = videoRef.current!;
-    if (!video.videoWidth || !video.videoHeight) {
-      rafId.current = requestAnimationFrame(analyzeLoop);
-      return;
-    }
-
-    const aCanvas = analyzeCanvasRef.current!;
-    const ratio = video.videoHeight / video.videoWidth;
-    const ah = Math.max(1, Math.round(ANALYZE_W * ratio));
-    aCanvas.width = ANALYZE_W;
-    aCanvas.height = ah;
-    const actx = aCanvas.getContext("2d", { willReadFrequently: true })!;
-    actx.drawImage(video, 0, 0, ANALYZE_W, ah);
-
-    // ROI central
-    const roiW = Math.max(8, Math.round(ANALYZE_W * ROI_RATIO));
-    const roiH = Math.max(8, Math.round(roiW * ratio));
-    const x0 = Math.floor((ANALYZE_W - roiW) / 2);
-    const y0 = Math.floor((ah - roiH) / 2);
-
-    const img = actx.getImageData(x0, y0, roiW, roiH).data;
-    const N = roiW * roiH;
-
-    // Luma + media
-    const curGray = new Uint8ClampedArray(N);
-    let sumY = 0;
-    for (let i = 0, p = 0; i < img.length; i += 4, p++) {
-      const r = img[i], g = img[i + 1], b = img[i + 2];
-      const y = (r * 299 + g * 587 + b * 114) / 1000; // 0..255
-      curGray[p] = y;
-      sumY += y;
-    }
-    const meanY = sumY / N;
-
-    // Compensación de exposición global entre frames
-    let motionPct = 100; // por defecto "mucho movimiento" si no hay frame previo
-    if (lastFrameGray.current) {
-      const prev = lastFrameGray.current;
-      const deltaMean = meanY - lastMeanY.current; // exposición global +/-
-
-      let changed = 0;
-      for (let p = 0; p < N; p++) {
-        // diferencia "compensada" por exposición global
-        const d = Math.abs((curGray[p] - prev[p]) - deltaMean);
-        if (d > PIX_DIFF_THRESH) changed++;
-      }
-      motionPct = (changed / N) * 100;
-    }
-
-    // Condiciones: luz aceptable + baja variación
-    const lightOk = meanY > 25 && meanY < 245;  // menos exigente en luz
-    if (lightOk && motionPct < MOTION_PCT_THRESH) {
-      stableCount.current++;
-      setAutoStatus("estable");
-      if (stableCount.current >= STABLE_FRAMES_NEEDED) {
-        stableCount.current = 0;
-        setAutoStatus("capturando");
-        shootAndSend();
-      }
-    } else {
-      stableCount.current = 0;
-      setAutoStatus("buscando");
-    }
-
-
-    // Debug y estado para el próximo ciclo
-    setDbg({ motionPct, meanY });
-    lastFrameGray.current = curGray;
-    lastMeanY.current = meanY;
-
-    rafId.current = requestAnimationFrame(analyzeLoop);
-  }, [autoOn, ready, shootAndSend]);
-
-
-  // arranque/parada del loop
+  // --- Timer periódico ---
   useEffect(() => {
-    if (autoOn && ready) {
-      // activar audio al primer tap (requisito iOS): toquecito en pantalla o en botón
-      const tapToInitAudio = () => {
-        try {
-          if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-          audioCtxRef.current.resume().catch(() => {});
-        } catch {}
-        window.removeEventListener("touchstart", tapToInitAudio);
-      };
-      window.addEventListener("touchstart", tapToInitAudio, { passive: true });
-
-      rafId.current = requestAnimationFrame(analyzeLoop);
-      return () => {
-        if (rafId.current) cancelAnimationFrame(rafId.current);
-        rafId.current = null;
-      };
+    // limpiar timer previo
+    if (intervalId.current) {
+      clearInterval(intervalId.current);
+      intervalId.current = null;
     }
-  }, [autoOn, ready, analyzeLoop]);
+    if (autoOn && ready) {
+      // dispara inmediatamente una vez al activar
+      enqueueCapture();
+      // y luego cada N segundos
+      intervalId.current = window.setInterval(enqueueCapture, Math.max(5, intervalSec) * 1000);
+    }
+    return () => {
+      if (intervalId.current) clearInterval(intervalId.current);
+      intervalId.current = null;
+    };
+  }, [autoOn, intervalSec, ready, enqueueCapture]);
 
-  // disparo manual por si lo necesitás
-  const manualShot = useCallback(() => {
-    beep(900, 0.05);
-    shootAndSend();
-  }, [shootAndSend, beep]);
+  // --- Disparo manual por si lo necesitás ---
+  const manualShot = useCallback(() => enqueueCapture(), [enqueueCapture]);
 
   return (
     <main style={{ display: "grid", gap: 12, padding: 12 }}>
       <h2>Cámara</h2>
+      <div
+        style={{
+          background: "#1b1b1b",
+          borderRadius: 10,
+          padding: "8px 10px",
+          fontSize: 18,
+          fontWeight: 600,
+        }}
+      >
+        {rows.length
+          ? rows.map((r, i) => {
+              const txt = r.ok && r.resp ? r.resp.answer : "ERR";
+              return (
+                <span key={r.id} style={{ whiteSpace: "nowrap" }}>
+                  {txt}{i < rows.length - 1 ? " - " : ""}
+                </span>
+              );
+            })
+          : "Sin resultados aún…"}
+      </div>
       {error && <p style={{ color: "#f88" }}>{error}</p>}
 
       <div style={{ position: "relative" }}>
@@ -243,78 +154,94 @@ export default function CameraPage() {
           muted
           playsInline
           autoPlay
-          onClick={manualShot} // por si querés tocar la pantalla
+          onClick={manualShot} // por si querés tocar pantalla
           style={{ width: "100%", borderRadius: 12 }}
         />
-        <canvas ref={photoCanvasRef} style={{ display: "none" }} />
-        <canvas ref={analyzeCanvasRef} style={{ display: "none" }} />
+        <canvas ref={canvasRef} style={{ display: "none" }} />
 
-        {/* overlay de estado */}
-        {(isSending || autoOn) && (
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              display: "grid",
-              placeItems: "end center",
-              padding: 8,
-              pointerEvents: "none",
-            }}
-          >
-            <div
-              style={{
-                background: "rgba(0,0,0,0.45)",
-                color: "#fff",
-                padding: "6px 10px",
-                borderRadius: 10,
-                fontSize: 12,
-              }}
-            >
-              {autoOn ? `Auto: ${autoStatus}` : "Auto: off"}
-              {isSending ? " • enviando…" : ""}
-            </div>
-          </div>
-        )}
+        {/* Estado arriba del video */}
+        <div
+          style={{
+            position: "absolute", top: 8, left: 8,
+            background: "rgba(0,0,0,0.5)", color: "#fff",
+            padding: "6px 10px", borderRadius: 10, fontSize: 12
+          }}
+        >
+          {autoOn ? `Auto cada ${intervalSec}s` : "Auto: off"}
+          {" • "}
+          {sendingRef.current ? "enviando…" : "idle"}
+          {" • cola:"} {queueLen}
+        </div>
       </div>
 
-      {/* controles */}
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      {/* Controles */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
         <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="checkbox"
-            checked={autoOn}
-            onChange={(e) => setAutoOn(e.target.checked)}
-          />
-          Modo auto
+          <input type="checkbox" checked={autoOn} onChange={(e) => setAutoOn(e.target.checked)} />
+          Modo automático
         </label>
-        <button onClick={manualShot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
-          Disparo manual
+
+        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          Intervalo (s)
+          <input
+            type="number"
+            value={intervalSec}
+            min={5}
+            onChange={(e) => setIntervalSec(Math.max(5, Number(e.target.value) || 40))}
+            style={{ width: 80, padding: 6, borderRadius: 8, background: "#111", color: "#fff", border: "1px solid #444" }}
+          />
+        </label>
+
+        <button onClick={manualShot} disabled={!ready} style={{ padding: 12, borderRadius: 12 }}>
+          Disparo manual ahora
+        </button>
+
+        <button
+          onClick={() => { setRows([]); }}
+          style={{ padding: 12, borderRadius: 12, background: "#222", border: "1px solid #444", color: "#ddd" }}
+        >
+          Limpiar resultados
         </button>
       </div>
 
-      {serverResp && (
-        <div style={{ marginTop: 8, padding: 12, borderRadius: 20, background: "#1b1b1b" }}>
-          <div style={{ fontSize: 14, opacity: 0.7 }}>Respuesta</div>
-          <div style={{ fontSize: 32, fontWeight: 700 }}>
-            {serverResp.answer}
-            <span style={{ fontSize: 16, marginLeft: 8, opacity: 0.7 }}>({serverResp.kind})</span>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            Confianza: {(serverResp.confidence * 100).toFixed(0)}%
-            <div style={{ height: 8, background: "#333", borderRadius: 8, marginTop: 4 }}>
-              <div
-                style={{
-                  height: 8,
-                  width: `${Math.round(serverResp.confidence * 100)}%`,
-                  borderRadius: 8,
-                  background: "#4ade80",
-                  transition: "width 200ms ease",
-                }}
-              />
+      {/* Resultados (uno bajo otro) */}
+      <div style={{ display: "grid", gap: 8 }}>
+        {rows.map((r) => (
+          <div key={r.id} style={{ background: "#1b1b1b", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              {new Date(r.ts).toLocaleTimeString()} • {r.ok ? "OK" : "ERROR"}
             </div>
+
+            {r.ok && r.resp ? (
+              <>
+                <div style={{ fontSize: 28, fontWeight: 700 }}>
+                  {r.resp.answer}
+                  <span style={{ fontSize: 14, marginLeft: 8, opacity: 0.7 }}>({r.resp.kind})</span>
+                </div>
+                <div style={{ marginTop: 6 }}>
+                  Confianza: {(r.resp.confidence * 100).toFixed(0)}%
+                  <div style={{ height: 8, background: "#333", borderRadius: 8, marginTop: 4 }}>
+                    <div
+                      style={{
+                        height: 8,
+                        width: `${Math.round(r.resp.confidence * 100)}%`,
+                        background: "#4ade80",
+                        borderRadius: 8,
+                        transition: "width 200ms ease",
+                      }}
+                    />
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div style={{ color: "#f88" }}>
+                {r.err || "Error desconocido"}
+              </div>
+            )}
           </div>
-        </div>
-      )}
+        ))}
+        {rows.length === 0 && <div style={{ opacity: 0.7, fontSize: 14 }}>Sin resultados aún…</div>}
+      </div>
     </main>
   );
 }
