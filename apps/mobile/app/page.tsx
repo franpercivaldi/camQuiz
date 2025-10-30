@@ -255,7 +255,7 @@ export default function CameraPage() {
       </div>
 
       {serverResp && (
-        <div style={{ marginTop: 8, padding: 12, borderRadius: 12, background: "#1b1b1b" }}>
+        <div style={{ marginTop: 8, padding: 12, borderRadius: 20, background: "#1b1b1b" }}>
           <div style={{ fontSize: 14, opacity: 0.7 }}>Respuesta</div>
           <div style={{ fontSize: 32, fontWeight: 700 }}>
             {serverResp.answer}
