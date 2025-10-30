@@ -15,15 +15,18 @@ export default function CameraPage() {
   const [autoOn, setAutoOn] = useState(true);
   const [autoStatus, setAutoStatus] = useState<"inicializando" | "buscando" | "estable" | "capturando" | "enviando">("inicializando");
   const rafId = useRef<number | null>(null);
-  const lastFrameGray = useRef<Uint8ClampedArray | null>(null);
   const stableCount = useRef(0);
   const lastShotAt = useRef(0);
 
   // config de auto
-  const DIFF_THRESHOLD = 6;        // menor = más sensible (grayscale 0..255)
-  const STABLE_FRAMES_NEEDED = 10; // ~10 frames estables seguidos
-  const COOLDOWN_MS = 1800;        // espera mínima entre capturas
-  const ANALYZE_W = 320;           // ancho para analizar (rápido)
+  const ANALYZE_W = 320;          // downscale para análisis
+  const ROI_RATIO = 0.7;          // 70% central
+  const PIX_DIFF_THRESH = 14;     // umbral por píxel tras compensar exposición (0-255)
+  const MOTION_PCT_THRESH = 0.8;  // % de píxeles cambiados para considerar "hay movimiento"
+  const STABLE_FRAMES_NEEDED = 8; // frames estables seguidos
+  const COOLDOWN_MS = 1500;       // espera mínima entre capturas
+  const ANALYZE_MIN_MS = 80;      // ~12.5 fps de análisis (throttle)
+  
   // beep de feedback
   const audioCtxRef = useRef<AudioContext | null>(null);
   const beep = useCallback((freq = 1200, dur = 0.12) => {
@@ -74,6 +77,12 @@ export default function CameraPage() {
     };
   }, []);
 
+  const lastFrameGray = useRef<Uint8ClampedArray | null>(null);
+  const lastMeanY = useRef(0);
+  const lastAnalysisAt = useRef(0);
+  const [dbg, setDbg] = useState({ motionPct: 0, meanY: 0 });
+
+
   // tomar foto completa y enviar
   const shootAndSend = useCallback(async () => {
     if (!ready || isSending) return;
@@ -112,60 +121,89 @@ export default function CameraPage() {
 
   // loop de análisis (autodisparo por estabilidad)
   const analyzeLoop = useCallback(() => {
-    if (!autoOn || !ready) return;
-    const video = videoRef.current!;
-    if (!video.videoWidth) {
-      rafId.current = requestAnimationFrame(analyzeLoop);
-      return;
-    }
+  if (!autoOn || !ready) return;
 
-    const aCanvas = analyzeCanvasRef.current!;
-    const ratio = video.videoHeight / video.videoWidth;
-    const ah = Math.max(1, Math.round(ANALYZE_W * ratio));
-    aCanvas.width = ANALYZE_W;
-    aCanvas.height = ah;
-    const actx = aCanvas.getContext("2d", { willReadFrequently: true })!;
-    actx.drawImage(video, 0, 0, ANALYZE_W, ah);
-    const img = actx.getImageData(0, 0, ANALYZE_W, ah).data;
-
-    // grayscale + diff vs frame anterior
-    const N = ANALYZE_W * ah;
-    const curGray = new Uint8ClampedArray(N);
-    let sumDiff = 0;
-    let sumY = 0;
-    for (let i = 0, p = 0; i < img.length; i += 4, p++) {
-      const r = img[i], g = img[i + 1], b = img[i + 2];
-      const y = (r * 299 + g * 587 + b * 114) / 1000; // 0..255
-      curGray[p] = y;
-      sumY += y;
-      if (lastFrameGray.current) {
-        const d = Math.abs(y - lastFrameGray.current[p]);
-        sumDiff += d;
-      }
-    }
-    const meanDiff = lastFrameGray.current ? (sumDiff / N) : 255;
-    const meanY = sumY / N;
-
-    // condiciones: luz suficiente y escena estable
-    const lightOk = meanY > 35 && meanY < 240;
-    if (lightOk && meanDiff < DIFF_THRESHOLD) {
-      stableCount.current++;
-      if (stableCount.current >= STABLE_FRAMES_NEEDED) {
-        setAutoStatus("capturando");
-        stableCount.current = 0;
-        // disparamos fuera del loop para no bloquear
-        shootAndSend();
-      } else {
-        setAutoStatus("estable");
-      }
-    } else {
-      stableCount.current = 0;
-      setAutoStatus("buscando");
-    }
-    lastFrameGray.current = curGray;
-
+  // throttle a ~12 fps
+  const now = performance.now();
+  if (now - lastAnalysisAt.current < ANALYZE_MIN_MS) {
     rafId.current = requestAnimationFrame(analyzeLoop);
-  }, [autoOn, ready, shootAndSend]);
+    return;
+  }
+  lastAnalysisAt.current = now;
+
+  const video = videoRef.current!;
+  if (!video.videoWidth || !video.videoHeight) {
+    rafId.current = requestAnimationFrame(analyzeLoop);
+    return;
+  }
+
+  const aCanvas = analyzeCanvasRef.current!;
+  const ratio = video.videoHeight / video.videoWidth;
+  const ah = Math.max(1, Math.round(ANALYZE_W * ratio));
+  aCanvas.width = ANALYZE_W;
+  aCanvas.height = ah;
+  const actx = aCanvas.getContext("2d", { willReadFrequently: true })!;
+  actx.drawImage(video, 0, 0, ANALYZE_W, ah);
+
+  // ROI central
+  const roiW = Math.max(8, Math.round(ANALYZE_W * ROI_RATIO));
+  const roiH = Math.max(8, Math.round(roiW * ratio));
+  const x0 = Math.floor((ANALYZE_W - roiW) / 2);
+  const y0 = Math.floor((ah - roiH) / 2);
+
+  const img = actx.getImageData(x0, y0, roiW, roiH).data;
+  const N = roiW * roiH;
+
+  // Luma + media
+  const curGray = new Uint8ClampedArray(N);
+  let sumY = 0;
+  for (let i = 0, p = 0; i < img.length; i += 4, p++) {
+    const r = img[i], g = img[i + 1], b = img[i + 2];
+    const y = (r * 299 + g * 587 + b * 114) / 1000; // 0..255
+    curGray[p] = y;
+    sumY += y;
+  }
+  const meanY = sumY / N;
+
+  // Compensación de exposición global entre frames
+  let motionPct = 100; // por defecto "mucho movimiento" si no hay frame previo
+  if (lastFrameGray.current) {
+    const prev = lastFrameGray.current;
+    const deltaMean = meanY - lastMeanY.current; // exposición global +/-
+
+    let changed = 0;
+    for (let p = 0; p < N; p++) {
+      // diferencia "compensada" por exposición global
+      const d = Math.abs((curGray[p] - prev[p]) - deltaMean);
+      if (d > PIX_DIFF_THRESH) changed++;
+    }
+    motionPct = (changed / N) * 100;
+  }
+
+  // Condiciones: luz aceptable + baja variación
+  const lightOk = meanY > 35 && meanY < 240;
+  if (lightOk && motionPct < MOTION_PCT_THRESH) {
+    stableCount.current++;
+    setAutoStatus("estable");
+    if (stableCount.current >= STABLE_FRAMES_NEEDED) {
+      stableCount.current = 0;
+      setAutoStatus("capturando");
+      // disparamos fuera del loop
+      shootAndSend();
+    }
+  } else {
+    stableCount.current = 0;
+    setAutoStatus("buscando");
+  }
+
+  // Debug y estado para el próximo ciclo
+  setDbg({ motionPct, meanY });
+  lastFrameGray.current = curGray;
+  lastMeanY.current = meanY;
+
+  rafId.current = requestAnimationFrame(analyzeLoop);
+}, [autoOn, ready, shootAndSend]);
+
 
   // arranque/parada del loop
   useEffect(() => {
