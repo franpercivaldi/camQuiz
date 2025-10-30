@@ -1,59 +1,51 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
-import { postAnswer, type AnswerPayload } from "../lib/api";
+import { postAnswer, type AnswerPayload } from "../../lib/api";
 
 export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const focusTrapRef = useRef<HTMLInputElement | null>(null);
-
+  const photoCanvasRef = useRef<HTMLCanvasElement | null>(null);     // para tomar la foto full
+  const analyzeCanvasRef = useRef<HTMLCanvasElement | null>(null);   // para análisis (downscaled)
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [serverResp, setServerResp] = useState<AnswerPayload | null>(null);
-  const [debugKey, setDebugKey] = useState<string>(""); // muestra última señal capturada
-  const [armed, setArmed] = useState(false);            // indica si pudimos “armar” sesión media + focus
 
-  const lastShotTs = useRef<number>(0);
+  // ---- AUTO MODE ----
+  const [autoOn, setAutoOn] = useState(true);
+  const [autoStatus, setAutoStatus] = useState<"inicializando" | "buscando" | "estable" | "capturando" | "enviando">("inicializando");
+  const rafId = useRef<number | null>(null);
+  const lastFrameGray = useRef<Uint8ClampedArray | null>(null);
+  const stableCount = useRef(0);
+  const lastShotAt = useRef(0);
 
-  // --- Disparo principal ---
-  const shoot = useCallback(async () => {
-    if (!ready || isSending) return;
-    const now = Date.now();
-    if (now - lastShotTs.current < 800) return; // anti-doble-disparo
-    lastShotTs.current = now;
-
-    const video = videoRef.current!;
-    const canvas = canvasRef.current!;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(video, 0, 0, w, h);
-
-    const url = canvas.toDataURL("image/jpeg", 0.9);
-    setServerResp(null);
-
+  // config de auto
+  const DIFF_THRESHOLD = 6;        // menor = más sensible (grayscale 0..255)
+  const STABLE_FRAMES_NEEDED = 10; // ~10 frames estables seguidos
+  const COOLDOWN_MS = 1800;        // espera mínima entre capturas
+  const ANALYZE_W = 320;           // ancho para analizar (rápido)
+  // beep de feedback
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const beep = useCallback((freq = 1200, dur = 0.12) => {
     try {
-      setIsSending(true);
-      const resp = await postAnswer(url);
-      setServerResp(resp);
-    } catch (e: any) {
-      alert(`Error: ${e?.message || e}`);
-    } finally {
-      setIsSending(false);
-    }
-  }, [ready, isSending]);
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const ac = audioCtxRef.current!;
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = "sine";
+      o.frequency.value = freq;
+      g.gain.value = 0.0001;
+      o.connect(g);
+      g.connect(ac.destination);
+      const now = ac.currentTime;
+      o.start(now);
+      g.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      o.stop(now + dur + 0.01);
+    } catch {}
+  }, []);
 
-  useEffect(() => {
-    const onVolume = () => shoot();
-    window.addEventListener("volume-trigger" as any, onVolume as any);
-    return () => window.removeEventListener("volume-trigger" as any, onVolume as any);
-  }, [shoot]);
-
-  // --- Cámara ---
+  // cámara
   useEffect(() => {
     let stream: MediaStream;
     (async () => {
@@ -70,6 +62,7 @@ export default function CameraPage() {
           videoRef.current.srcObject = stream;
           await videoRef.current.play().catch(() => {});
           setReady(true);
+          setAutoStatus("buscando");
         }
       } catch (e: any) {
         console.error("getUserMedia error", e);
@@ -81,78 +74,125 @@ export default function CameraPage() {
     };
   }, []);
 
-  // --- Intentamos “armar” (media session + focus teclado) ---
-  const armRemote = useCallback(async () => {
-    // 1) reproducir audio silencioso en loop (activa MediaSession en iOS)
-    if (!audioRef.current) {
-      const el = document.createElement("audio");
-      el.muted = true;
-      el.loop = true;
-      el.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA="; // 1s silencio
-      audioRef.current = el;
-    }
+  // tomar foto completa y enviar
+  const shootAndSend = useCallback(async () => {
+    if (!ready || isSending) return;
+    const now = Date.now();
+    if (now - lastShotAt.current < COOLDOWN_MS) return;
+    lastShotAt.current = now;
+
+    const video = videoRef.current!;
+    const photoCanvas = photoCanvasRef.current!;
+    // foto full a resolución del video
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    photoCanvas.width = w;
+    photoCanvas.height = h;
+    const pctx = photoCanvas.getContext("2d")!;
+    pctx.drawImage(video, 0, 0, w, h);
+    const dataUrl = photoCanvas.toDataURL("image/jpeg", 0.9);
+
+    setServerResp(null);
+    setAutoStatus("enviando");
+    beep(1000, 0.08); // beep corto de “capturado”
+
     try {
-      await audioRef.current.play();
-    } catch {
-      // puede fallar si no hay gesto del usuario; no es fatal
+      setIsSending(true);
+      const resp = await postAnswer(dataUrl);
+      setServerResp(resp);
+    } catch (e: any) {
+      alert(`Error: ${e?.message || e}`);
+    } finally {
+      setIsSending(false);
+      // tras enviar, volvemos a buscar otra captura
+      setAutoStatus("buscando");
+      stableCount.current = 0;
+    }
+  }, [ready, isSending]);
+
+  // loop de análisis (autodisparo por estabilidad)
+  const analyzeLoop = useCallback(() => {
+    if (!autoOn || !ready) return;
+    const video = videoRef.current!;
+    if (!video.videoWidth) {
+      rafId.current = requestAnimationFrame(analyzeLoop);
+      return;
     }
 
-    // 2) Media Session handlers (Play/Pause/Prev/Next/Stop)
-    if ("mediaSession" in navigator) {
-      navigator.mediaSession.metadata = new MediaMetadata({ title: "Camera Remote" });
-      const set = (action: MediaSessionAction, handler: () => void) => {
-        try {
-          navigator.mediaSession!.setActionHandler(action, () => {
-            setDebugKey(`mediaAction="${action}"`);
-            handler();
-          });
-        } catch {}
-      };
-      set("play", shoot);
-      set("pause", shoot);
-      set("previoustrack", shoot);
-      set("nexttrack", shoot);
-      set("stop", shoot);
-      // (si querés, también podrías mapear seek* a shoot)
-    }
+    const aCanvas = analyzeCanvasRef.current!;
+    const ratio = video.videoHeight / video.videoWidth;
+    const ah = Math.max(1, Math.round(ANALYZE_W * ratio));
+    aCanvas.width = ANALYZE_W;
+    aCanvas.height = ah;
+    const actx = aCanvas.getContext("2d", { willReadFrequently: true })!;
+    actx.drawImage(video, 0, 0, ANALYZE_W, ah);
+    const img = actx.getImageData(0, 0, ANALYZE_W, ah).data;
 
-    // 3) Forzamos foco en input oculto para recibir teclas (Enter/Space)
-    const inp = focusTrapRef.current;
-    if (inp) {
-      try {
-        inp.focus({ preventScroll: true });
-      } catch {}
-    }
-
-    setArmed(true);
-  }, [shoot]);
-
-  // Intento automático de armado al montar + al tocar pantalla (para cumplir gesto de usuario en iOS)
-  useEffect(() => {
-    armRemote();
-    const tapToArm = () => armRemote();
-    window.addEventListener("touchstart", tapToArm, { passive: true });
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) armRemote();
-    });
-    return () => {
-      window.removeEventListener("touchstart", tapToArm);
-    };
-  }, [armRemote]);
-
-  // --- Teclado (Enter / Space / NumpadEnter) ---
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      setDebugKey(`key="${e.key}" code="${(e as any).code || ""}"`);
-      const keys = new Set(["Enter", " ", "NumpadEnter"]);
-      if (keys.has(e.key)) {
-        e.preventDefault();
-        shoot();
+    // grayscale + diff vs frame anterior
+    const N = ANALYZE_W * ah;
+    const curGray = new Uint8ClampedArray(N);
+    let sumDiff = 0;
+    let sumY = 0;
+    for (let i = 0, p = 0; i < img.length; i += 4, p++) {
+      const r = img[i], g = img[i + 1], b = img[i + 2];
+      const y = (r * 299 + g * 587 + b * 114) / 1000; // 0..255
+      curGray[p] = y;
+      sumY += y;
+      if (lastFrameGray.current) {
+        const d = Math.abs(y - lastFrameGray.current[p]);
+        sumDiff += d;
       }
-    };
-    window.addEventListener("keydown", onKeyDown, { passive: false });
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [shoot]);
+    }
+    const meanDiff = lastFrameGray.current ? (sumDiff / N) : 255;
+    const meanY = sumY / N;
+
+    // condiciones: luz suficiente y escena estable
+    const lightOk = meanY > 35 && meanY < 240;
+    if (lightOk && meanDiff < DIFF_THRESHOLD) {
+      stableCount.current++;
+      if (stableCount.current >= STABLE_FRAMES_NEEDED) {
+        setAutoStatus("capturando");
+        stableCount.current = 0;
+        // disparamos fuera del loop para no bloquear
+        shootAndSend();
+      } else {
+        setAutoStatus("estable");
+      }
+    } else {
+      stableCount.current = 0;
+      setAutoStatus("buscando");
+    }
+    lastFrameGray.current = curGray;
+
+    rafId.current = requestAnimationFrame(analyzeLoop);
+  }, [autoOn, ready, shootAndSend]);
+
+  // arranque/parada del loop
+  useEffect(() => {
+    if (autoOn && ready) {
+      // activar audio al primer tap (requisito iOS): toquecito en pantalla o en botón
+      const tapToInitAudio = () => {
+        try {
+          if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+          audioCtxRef.current.resume().catch(() => {});
+        } catch {}
+        window.removeEventListener("touchstart", tapToInitAudio);
+      };
+      window.addEventListener("touchstart", tapToInitAudio, { passive: true });
+
+      rafId.current = requestAnimationFrame(analyzeLoop);
+      return () => {
+        if (rafId.current) cancelAnimationFrame(rafId.current);
+        rafId.current = null;
+      };
+    }
+  }, [autoOn, ready, analyzeLoop]);
+
+  // disparo manual por si lo necesitás
+  const manualShot = useCallback(() => {
+    beep(900, 0.05);
+    shootAndSend();
+  }, [shootAndSend, beep]);
 
   return (
     <main style={{ display: "grid", gap: 12, padding: 12 }}>
@@ -165,50 +205,54 @@ export default function CameraPage() {
           muted
           playsInline
           autoPlay
-          onClick={shoot} // por si querés tocar pantalla
+          onClick={manualShot} // por si querés tocar la pantalla
           style={{ width: "100%", borderRadius: 12 }}
         />
-        <canvas ref={canvasRef} style={{ display: "none" }} />
+        <canvas ref={photoCanvasRef} style={{ display: "none" }} />
+        <canvas ref={analyzeCanvasRef} style={{ display: "none" }} />
 
-        {/* input oculto para recibir teclas del control (modo teclado) */}
-        <input
-          ref={focusTrapRef}
-          aria-hidden
-          tabIndex={-1}
-          style={{ position: "absolute", opacity: 0, width: 1, height: 1, pointerEvents: "none" }}
-          onBlur={() => {
-            // si pierde foco, reintenta
-            setTimeout(() => focusTrapRef.current?.focus({ preventScroll: true }), 0);
-          }}
-        />
-
-        {isSending && (
+        {/* overlay de estado */}
+        {(isSending || autoOn) && (
           <div
             style={{
               position: "absolute",
               inset: 0,
-              background: "rgba(0,0,0,0.45)",
               display: "grid",
-              placeItems: "center",
-              borderRadius: 12,
-              fontWeight: 600,
+              placeItems: "end center",
+              padding: 8,
+              pointerEvents: "none",
             }}
           >
-            Procesando…
+            <div
+              style={{
+                background: "rgba(0,0,0,0.45)",
+                color: "#fff",
+                padding: "6px 10px",
+                borderRadius: 10,
+                fontSize: 12,
+              }}
+            >
+              {autoOn ? `Auto: ${autoStatus}` : "Auto: off"}
+              {isSending ? " • enviando…" : ""}
+            </div>
           </div>
         )}
       </div>
 
-      {/* Banda de estado para armar / debug */}
-      <div style={{ fontSize: 12, opacity: 0.7 }}>
-        {armed ? "Remoto: armado" : "Remoto: armando… (si tu iPhone pide gesto, toca una vez la pantalla)"}
-        {debugKey && <div>Input capturado: {debugKey}</div>}
+      {/* controles */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={autoOn}
+            onChange={(e) => setAutoOn(e.target.checked)}
+          />
+          Modo auto
+        </label>
+        <button onClick={manualShot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
+          Disparo manual
+        </button>
       </div>
-
-      {/* Botón manual de respaldo */}
-      <button onClick={shoot} disabled={!ready || isSending} style={{ padding: 12, borderRadius: 12 }}>
-        Disparar (control BT / teclas media / tap)
-      </button>
 
       {serverResp && (
         <div style={{ marginTop: 8, padding: 12, borderRadius: 12, background: "#1b1b1b" }}>
