@@ -1,3 +1,4 @@
+export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { broadcastAnswer } from "../../../lib/realtime.server";
 import { z } from "zod";
@@ -108,10 +109,13 @@ export async function POST(req: NextRequest) {
       parsed = JSON.parse(txt);
     } catch {
       const out = OutputSchema.parse(mockAnswer(input.imageDataUrl));
+      await broadcastAnswer(input.sessionId, out); // <-- FALTA EMITIR ACÁ
       return NextResponse.json(out, { status: 200 });
     }
 
     const out = OutputSchema.parse(parsed);
+    await broadcastAnswer(input.sessionId, out);    // <-- FALTA EMITIR ACÁ
+
     return NextResponse.json(out, { status: 200 });
   } catch (err: any) {
     return NextResponse.json({ error: err?.message || "Invalid input" }, { status: 400 });
