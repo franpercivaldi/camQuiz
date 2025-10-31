@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
-import { postAnswer, type AnswerPayload } from "../lib/api";
+import { postAnswer, type AnswerPayload, postShot } from "../lib/api";
 
 type Job = { id: string; ts: number; dataUrl: string };
 type Row = { id: string; ts: number; ok: boolean; resp?: AnswerPayload; err?: string };
@@ -79,8 +79,12 @@ export default function CameraPage() {
     const job: Job = { id: crypto.randomUUID(), ts: Date.now(), dataUrl };
     queueRef.current.push(job);
     setQueueLen(queueRef.current.length);
+
+    // Avisar SHOT a la segunda pantalla (no bloqueante)
+    postShot(sessionId, job.id, job.ts, intervalSec).catch(() => {});
+
     processQueue(); // intentar procesar ya
-  }, [captureFrame]);
+  }, [captureFrame, intervalSec, sessionId]);
 
   // --- Worker secuencial de la cola ---
   const processQueue = useCallback(async () => {
@@ -92,8 +96,9 @@ export default function CameraPage() {
     setQueueLen(queueRef.current.length);
 
     try {
-      const resp = await postAnswer(job.dataUrl, sessionId);
-      setRows((old) => [ ...old, { id: job.id, ts: job.ts, ok: true, resp }].slice(-100)); // conserva últimos 100
+      // Pasamos también job.id para que el backend lo re-emita y el visor pueda casar respuesta↔pendiente
+      const resp = await postAnswer(job.dataUrl, sessionId, job.id);
+      setRows((old) => [...old, { id: job.id, ts: job.ts, ok: true, resp }].slice(-100)); // conserva últimos 100
     } catch (e: any) {
       setRows((old) => [...old, { id: job.id, ts: job.ts, ok: false, err: e?.message || String(e) }].slice(-100));
     } finally {
@@ -101,7 +106,7 @@ export default function CameraPage() {
       // Si quedan trabajos, procesa el siguiente
       if (queueRef.current.length > 0) processQueue();
     }
-  }, []);
+  }, [sessionId]);
 
   // --- Timer periódico ---
   useEffect(() => {

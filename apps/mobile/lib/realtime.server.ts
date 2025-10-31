@@ -16,7 +16,11 @@ export const pusherServer = hasPusher
   : null;
 
 export async function broadcastAnswer(sessionId: string | undefined, payload: any) {
-  if (!pusherServer || !sessionId) return;     // si no hay Pusher o session, no hace nada
-  const channel = `sess-${sessionId}`;
-  await pusherServer.trigger(channel, "answer", payload);
+  if (!pusherServer || !sessionId) return;
+  await pusherServer.trigger(`sess-${sessionId}`, "answer", payload);
+}
+
+export async function broadcastShot(sessionId: string | undefined, payload: any) {
+  if (!pusherServer || !sessionId) return;
+  await pusherServer.trigger(`sess-${sessionId}`, "shot", payload);
 }

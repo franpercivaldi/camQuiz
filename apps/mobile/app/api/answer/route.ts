@@ -8,6 +8,7 @@ import OpenAI from "openai";
 const InputSchema = z.object({
   imageDataUrl: z.string().min(50),
   sessionId: z.string().uuid().optional(),
+  jobId: z.string().min(8).optional(), 
 });
 
 const OutputSchema = z.object({
@@ -73,7 +74,7 @@ export async function POST(req: NextRequest) {
     const client = getClient();
     if (!client) {
       const out = OutputSchema.parse(mockAnswer(input.imageDataUrl));
-      await broadcastAnswer(input.sessionId, out);
+      await broadcastAnswer(input.sessionId, { jobId: input.jobId, ...out });
       return NextResponse.json(out, { status: 200 });
     }
 
@@ -100,7 +101,7 @@ export async function POST(req: NextRequest) {
     } catch (e: any) {
       // Fallback a mock para no romper UX en prod
       const out = OutputSchema.parse(mockAnswer(input.imageDataUrl));
-      await broadcastAnswer(input.sessionId, out);
+      await broadcastAnswer(input.sessionId, { jobId: input.jobId, ...out });
       return NextResponse.json(out, { status: 200 });
     }
 
