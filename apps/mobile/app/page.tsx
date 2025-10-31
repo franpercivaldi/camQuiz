@@ -9,6 +9,8 @@ export default function CameraPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  const [sessionId] = useState(() => crypto.randomUUID()); // se fija al cargar
+
   // Cámara / estado básico
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -90,7 +92,7 @@ export default function CameraPage() {
     setQueueLen(queueRef.current.length);
 
     try {
-      const resp = await postAnswer(job.dataUrl);
+      const resp = await postAnswer(job.dataUrl, sessionId);
       setRows((old) => [ ...old, { id: job.id, ts: job.ts, ok: true, resp }].slice(-100)); // conserva últimos 100
     } catch (e: any) {
       setRows((old) => [...old, { id: job.id, ts: job.ts, ok: false, err: e?.message || String(e) }].slice(-100));
@@ -126,6 +128,9 @@ export default function CameraPage() {
   return (
     <main style={{ display: "grid", gap: 12, padding: 12 }}>
       <h2>Cámara</h2>
+      <div style={{fontSize:12, opacity:.8}}>
+        Ver en vivo: <code>/respuestas/{sessionId}</code>
+      </div>
       <div
         style={{
           background: "#1b1b1b",

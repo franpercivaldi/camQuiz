@@ -1,15 +1,14 @@
 export type AnswerPayload = {
   kind: "MC" | "VF";
-  // "V"|"F" o "A".."E" o "1".."10"
   answer: string;
   confidence: number;
 };
 
-export async function postAnswer(imageDataUrl: string) {
+export async function postAnswer(imageDataUrl: string, sessionId?: string) {
   const res = await fetch("/api/answer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ imageDataUrl }),
+    body: JSON.stringify({ imageDataUrl, sessionId }),
   });
   if (!res.ok) {
     const info = await res.json().catch(() => ({}));
